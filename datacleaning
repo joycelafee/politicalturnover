@@ -1,0 +1,224 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Dec 29 10:51:49 2020
+
+@author: Joyce Wang
+"""
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import os
+
+# set working directory
+path = os.path.abspath(os.getcwd())
+
+
+# Here is the list of links to the datafiles
+penn_url = "https://www.rug.nl/ggdc/docs/pwt90.xlsx" # data on GDP
+archi_url = "https://www.rochester.edu/college/faculty/hgoemans/Archigos_4.1_stata14.dta" #  leader turnover
+dd_url = "https://uofi.box.com/shared/static/d27425539c9d662a7041.xls" # excel dataset on democracy (note the stata dta differs from xls file)
+polity_url = "http://www.systemicpeace.org/inscr/p5v2018.xls" # excel dataset on polity score
+
+
+
+""""Reading in data"""
+penn = pd.read_excel(penn_url,'Data') # reading the sheet named 'Data'
+archi = pd.read_stata(archi_url)
+dd = pd.read_excel(dd_url)
+polity = pd.read_excel(polity_url)
+# for convenience, I cleaned the UCDP/PRIO Armed Conflict Dataset in excel and saved as csv file
+conflict = pd.read_csv("DATASETS/UCDP_PRIO Armed Conflict.csv")
+
+
+
+
+""""Data Cleaning on the Penn World Dataset"""
+# create a new dataframe and select the specific columns we want
+df_penn = penn[['countrycode','country','year','pop','cgdpo']]
+
+# create a new column of yearly GDP growth rate grouped by country (based on cgdpo)
+df_penn['cgdpo_growth']=df_penn.sort_values(['year']).groupby('country')[['cgdpo']].pct_change()
+
+# create a new column with decile variable on the growth rate
+df_penn['cgdpo_growth10'] = pd.qcut(df_penn['cgdpo_growth'], 10, labels=False)
+
+df_penn = df_penn.dropna() # drop all missing data dropped
+
+# create a binary indicator with 1 indicating growth rate less than the 10%
+df_penn['cgdpo_indc'] = df_penn.apply(lambda row: 1 if row['cgdpo_growth10']==0 else 0, axis=1)
+df_penn['pcgdp'] = df_penn['cgdpo']/df_penn['pop'] # create a per capita gdp variable
+
+
+""""Data Cleaning on the Archigos Dataset"""
+df_leader = archi[['obsid','ccode','idacr','leader','eindate','eoutdate','prevtimesinoffice','gender','yrborn']]
+
+# manipulate the confusing values (Germany, Serbia)
+df_leader = df_leader[df_leader.idacr!='GMY'] # Germany
+df_leader = df_leader[df_leader.idacr!='GDR'] # Germany
+df_leader = df_leader[df_leader.ccode!=347] # Serbia
+df_leader['ccode']=df_leader.ccode.replace({340:342, 345:347}) # Serbia
+
+# data manipulation and transformation
+gender = {'M': 1,'F': 0} # create a dictionary to convert string into binary data
+df_leader.gender = [gender[item] for item in df_leader.gender] # convert string into binary
+df_leader['gender'].unique() # check the data
+df_leader['year'] = pd.DatetimeIndex(df_leader['eindate']).year # create a new column indicating year of the record
+
+countries = df_leader['idacr'].unique() # list of countries in df_leader data
+# df_leader['year'].min() # 1840
+# df_leader['year'].max() # 2015
+yr = list(range(df_leader['year'].min(), df_leader['year'].max()+1)) # from year 1840 to year 2015, 176 accounts
+yrs = yr*countries.shape[0]
+year = np.array(yrs) # create an array of year
+country = np.repeat(countries,len(yr)) # create an array of country
+data = pd.DataFrame({'country':country,'year':year}) # create the pandas dataframe
+
+df_leader = pd.merge(data, df_leader,
+               how ='outer',
+               left_on=['year','country'],
+               right_on = ['year','idacr'])
+df_leader = df_leader.groupby('country').ffill() # fill in the blank data
+df_leader = df_leader[df_leader['year']>1950] # filter years above 1950
+
+df_leader.isnull().sum() # check missing values
+df_leader = df_leader.dropna() # drop missing values
+
+df_leader['inofficeyear'] = pd.DatetimeIndex(df_leader['eindate']).year
+df_leader['outofficeyear'] = pd.DatetimeIndex(df_leader['eoutdate']).year
+
+df_leader['age'] = df_leader.year - df_leader.yrborn # create a new column indicating leader age at the year
+
+# create a lambda function to apply indicators
+df_leader['turnover'] = df_leader.apply(lambda row: 1 if row['year']==row['inofficeyear'] else 0, axis=1)
+df_leader['yeardate'] = pd.to_datetime(df_leader['year'], format='%Y')
+df_leader.yeardate = df_leader.yeardate.apply(lambda dt: dt.replace(day=31, month=12))
+
+df_leader = df_leader.drop(df_leader[(df_leader['inofficeyear']==df_leader['outofficeyear']) & (df_leader['year']!=df_leader['inofficeyear'])]
+.index) # filter out invalid data which emerged from special cases due to wartime
+
+df_leader['curdays'] = df_leader.apply(
+    lambda row: row['eoutdate'] - row['eindate']
+    if (row['inofficeyear']==row['year'])&(row['inofficeyear']==row['outofficeyear'])
+    else row['yeardate'] - row['eindate'],
+    axis=1)
+df_leader.curdays = df_leader.curdays.dt.days
+
+df_leader = df_leader[['idacr','ccode','year','turnover','leader','gender','age','curdays','prevtimesinoffice']]
+
+
+
+
+""""Data Cleaning on the DD Dataset"""
+df_demo = dd[['ctryname','year','qogctylett','cowcode','politycode','democracy']]
+df_demo = df_demo[df_demo['democracy']==1] # filter out only the democracies
+
+# manipulate the confusing values (Germany, Serbia)
+df_demo['cowcode']=df_demo.cowcode.replace({255:260, 345:347}) # Germany and Serbia
+df_demo.loc[df_demo.qogctylett=='SRB', 'cowcode'] = 342 # Serbia
+df_demo['qogctylett']=df_demo.qogctylett.replace({'SCG':'SRB'}) 
+
+df_demo08 = df_demo[df_demo['year']==2008] # filter out only the year 2008 for repeat
+
+# NOTE: due to time restraint, we will copy the data of 2008 and repeat it for year 2009-2015, 
+# assuming the number of democratic countries stay the same
+for year in list(range(2009, 2016)):
+    newadd = df_demo08.replace(2008, year)
+    df_demo = df_demo.append(newadd)
+df_demo = df_demo.sort_values(by=['ctryname', 'year'])
+
+df_demo['ctryname']=df_demo.ctryname.replace({'Serbia and Montenegro':'Serbia'})
+
+
+
+""""Data Cleaning on the polity5 Dataset"""
+df_pol = polity[['country','year','ccode','scode','polity2']]
+
+# manipulate the confusing values (Germany, Serbia, Pakistan)
+df_pol = df_pol[df_pol.country!='Germany East'] # Germany
+df_pol = df_pol[df_pol.country!='Prussia'] # Germany
+df_pol['ccode']=df_pol.ccode.replace({255:260, 769:770}) 
+df_pol['scode']=df_pol.scode.replace({'GMY':'GFR', 'PKS':'PAK'})
+
+df_pol.shape # (17434, 5)
+
+df_pol.drop(df_pol.loc[(df_pol['year']==2006)&(df_pol['scode']=='YGS')].index, inplace=True)
+
+
+"""
+MERGE THE DATA
+"""
+
+# first merge the Archigos data on leader turnover (idacr) with Polity5 data on polity2 score (scode)
+df1 = pd.merge(df_leader, df_pol, 
+              how='inner',
+              on=['year','ccode'])
+
+# next merge df1 (ccode) with DD dataset on Democracy (cowcode)
+df2 = pd.merge(df1, df_demo,
+               how ='inner',
+               left_on=['year','ccode'],
+               right_on = ['year','cowcode'])
+
+# next merge df2 (qogctylett) with penn world data (countrycode)
+df3 = pd.merge(df2, df_penn, 
+              how='inner',
+              left_on=['year','qogctylett'],
+              right_on = ['year','countrycode'])
+
+# select the variables of interests
+df = df3[['ccode','scode','countrycode','ctryname','year','democracy','pop','cgdpo','cgdpo_growth','cgdpo_indc','pcgdp','polity2','turnover','leader','gender','age','curdays','prevtimesinoffice']]
+df.sort_values(by=['ctryname', 'year']) # sort the data
+
+
+"""
+MERGE THE DATA WITH DATA ON ARMED CONFLICT - UCDP/PRIO Armed Conflict Dataset
+"""
+conflict['armconf'] = 1 # add a column of indicator of armed conflict
+
+# merge with the dataset previously
+df = pd.merge(df, conflict,
+               how ='left',
+               on = ['ctryname','year'])
+
+df.isnull().sum() # check for missing values
+df['armconf']=df['armconf'].fillna(0) # fill in missing data with 0 - representing no armed conflict
+
+
+
+"""
+REGRESSION ANALYSIS
+"""
+# create the list of controls and independent variables
+Xvar_list = ['cgdpo_indc','pcgdp','gender','age','curdays','prevtimesinoffice','polity2','armconf']
+
+# df['cgdpo_indc_lag'] = df.groupby('country')['cgdpo_indc'].shift(1)
+
+Xvar = []
+def lagfun(df,varlist):
+    for i in varlist:
+        newvar = i+'_lag'
+        Xvar.append(newvar)
+        df[newvar] = df.groupby('ctryname')[i].shift(1)
+lagfun(df,Xvar_list) # create the lag controls
+
+df.isnull().sum() # Check missing values
+df = df.dropna() # remove missing values
+
+
+print(Xvar) # check the indepdent variable and controls are lagged values
+Xvar = df[Xvar]
+Xvar = sm.add_constant(Xvar) # add a constant value
+Yvar = df['turnover'] # dependent variable
+
+
+model = sm.OLS(Yvar, Xvar).fit()
+summary = model.summary()
+
+# Save the data
+df.to_csv ('df.csv', 
+           index = False, 
+           header=True)
+
+
+
+
